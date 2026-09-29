@@ -1,0 +1,6 @@
+id=konabess_cli_undervolt
+name=KonaBess Native CLI & Auto-Undervolt
+version=v2.0-cli
+versionCode=20
+author=libxzr / Antigravity
+description=APK-free Qualcomm Adreno GPU undervolting CLI & OTA auto-patch daemon for Magisk / KernelSU / APatch. Supports Snapdragon 855 to Snapdragon 8 Gen 3.

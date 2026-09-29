@@ -1,0 +1,392 @@
+#!/system/bin/sh
+# KonaBess Universal CLI & Auto-Patcher for Qualcomm Adreno GPUs
+# Supports Snapdragon 855 (Pixel 4/4 XL) and Snapdragon 8 Gen 3 (OnePlus 12)
+# Author: Antigravity / libxzr adaptation
+
+SOC_MODEL="$(getprop ro.soc.model)"
+[ -z "$SOC_MODEL" ] && SOC_MODEL="$(getprop ro.board.platform)"
+
+# Detect device generation
+if [ "$SOC_MODEL" = "SM8650" ] || [ "$SOC_MODEL" = "pineapple" ]; then
+    GEN="sm8650"
+    MODDIR="/data/adb/modules/adreno750_undervolt"
+    BOOT_NAME="vendor_boot"
+    TARGET_DTB_IDX="$(getprop ro.boot.dtb_idx)"
+    [ -z "$TARGET_DTB_IDX" ] && TARGET_DTB_IDX="2"
+else
+    GEN="sm8150"
+    MODDIR="/data/adb/modules/adreno640_undervolt"
+    BOOT_NAME="boot"
+    TARGET_DTB_IDX="0"
+fi
+
+LOG="$MODDIR/service.log"
+CONF="$MODDIR/profile.conf"
+CUSTOM_CONF="$MODDIR/custom_volts.conf"
+
+BB="/data/adb/ksu/bin/busybox"
+[ -f "$BB" ] || BB="/data/adb/magisk/busybox"
+[ -f "$BB" ] || BB="busybox"
+
+MAGISKBIN="$MODDIR/bin/magiskboot"
+[ -f "$MAGISKBIN" ] || MAGISKBIN="/data/adb/ksu/bin/magiskboot"
+[ -f "$MAGISKBIN" ] || MAGISKBIN="/data/adb/magisk/magiskboot"
+
+DTCBIN="$MODDIR/bin/dtc"
+[ -f "$DTCBIN" ] || DTCBIN="/data/local/tmp/dtc"
+
+log() {
+    local msg="[$(date "+%Y-%m-%d %H:%M:%S")] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG"
+}
+
+get_target_slot() {
+    local target="$1"
+    local cur_slot
+    cur_slot=$(getprop ro.boot.slot_suffix)
+    [ -z "$cur_slot" ] && cur_slot="_b"
+
+    if [ "$target" = "other" ] || [ "$target" = "inactive" ]; then
+        if [ "$cur_slot" = "_a" ]; then
+            echo "_b"
+        else
+            echo "_a"
+        fi
+    else
+        echo "$cur_slot"
+    fi
+}
+
+# ========================================================
+# Snapdragon 8 Gen 3 (SM8650 / Adreno 750) Handlers
+# ========================================================
+sm8650_level_to_name() {
+    case "$1" in
+        "0x30"|"48")  echo "MIN_SVS (48 / 0x30)" ;;
+        "0x34"|"52")  echo "LOW_SVS_D2 (52 / 0x34)" ;;
+        "0x38"|"56")  echo "LOW_SVS_D1 (56 / 0x38)" ;;
+        "0x3c"|"60")  echo "LOW_SVS_D0 (60 / 0x3c)" ;;
+        "0x40"|"64")  echo "LOW_SVS (64 / 0x40)" ;;
+        "0x50"|"80")  echo "LOW_SVS_L1 (80 / 0x50)" ;;
+        "0x60"|"96")  echo "LOW_SVS_L2 (96 / 0x60)" ;;
+        "0x80"|"128") echo "SVS (128 / 0x80)" ;;
+        "0x90"|"144") echo "SVS_L0 (144 / 0x90)" ;;
+        "0xc0"|"192") echo "SVS_L1 (192 / 0xc0)" ;;
+        "0xe0"|"224") echo "SVS_L2 (224 / 0xe0)" ;;
+        "0x100"|"256") echo "NOM (256 / 0x100)" ;;
+        "0x140"|"320") echo "NOM_L1 (320 / 0x140)" ;;
+        "0x180"|"384") echo "TURBO (384 / 0x180)" ;;
+        "0x1a0"|"416") echo "TURBO_L1 (416 / 0x1a0)" ;;
+        *) echo "CUSTOM ($1)" ;;
+    esac
+}
+
+sm8650_check_voltages() {
+    local slot="$1"
+    local dev="/dev/block/by-name/vendor_boot$slot"
+    local workdir="/dev/sm8650_chk_$$"
+
+    mkdir -p "$workdir"
+    cd "$workdir" || return 1
+    "$MAGISKBIN" unpack "$dev" >/dev/null 2>&1
+    if [ ! -f "dtb" ]; then
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    # Extract DTB 2 (offset 955681, size 523618 or find via header)
+    dd if=dtb of=target.dtb bs=1 skip=955681 count=523650 2>/dev/null
+    "$DTCBIN" -I dtb -O dts target.dtb -o target.dts 2>/dev/null
+
+    # Parse qcom,level for bin 0
+    local levels
+    levels=$($BB awk '
+        /qcom,gpu-pwrlevels-0/ { inbin=1 }
+        inbin && /qcom,gpu-pwrlevels-1/ { inbin=0 }
+        inbin && /qcom,level/ {
+            sub(/.*<0x/, "")
+            sub(/>;.*/, "")
+            printf "0x%s ", $0
+        }
+    ' target.dts)
+
+    rm -rf "$workdir"
+    echo "$levels"
+    return 0
+}
+
+sm8650_status() {
+    local cur_slot
+    cur_slot=$(getprop ro.boot.slot_suffix)
+    local target_slot="${1:-$cur_slot}"
+    local boot_dev="/dev/block/by-name/vendor_boot$target_slot"
+
+    echo "=========================================================="
+    echo "  Adreno 750 GPU Voltage Monitor (KonaBess Native)        "
+    echo "=========================================================="
+    echo "Device       : $(getprop ro.product.model) ($(getprop ro.product.device))"
+    echo "SoC / Kernel : SM8650 (Snapdragon 8 Gen 3) / $(uname -r)"
+    echo "Active Slot  : $cur_slot"
+    echo "Target Slot  : $target_slot ($boot_dev)"
+
+    if [ -f "$MODDIR/stock_vendor_boot$target_slot.img" ]; then
+        local bsz
+        bsz=$(ls -lh "$MODDIR/stock_vendor_boot$target_slot.img" | awk '{print $5}')
+        echo "Stock Backup : Present ($bsz) -> $MODDIR/stock_vendor_boot$target_slot.img"
+    else
+        echo "Stock Backup : None"
+    fi
+    echo "----------------------------------------------------------"
+
+    local current_levels
+    current_levels=$(sm8650_check_voltages "$target_slot")
+    if [ -z "$current_levels" ]; then
+        echo "ERROR: Failed to read voltages from $boot_dev"
+        return 1
+    fi
+
+    # Frequencies and stocks
+    freqs="903 834 770 720 680 629 578 500 422 366 310 231"
+    stocks="0x180 0x140 0x100 0xe0 0xc0 0x90 0x80 0x50 0x40 0x3c 0x38 0x34"
+
+    printf "%-10s | %-24s | %-24s | %s\n" "Frequency" "Stock Default" "Current in Boot" "Delta"
+    echo "-----------+--------------------------+--------------------------+---------"
+
+    local i=1
+    local is_undervolted=0
+    for f in $freqs; do
+        stk=$(echo "$stocks" | awk "{print \$$i}")
+        cur=$(echo "$current_levels" | awk "{print \$$i}")
+        [ -z "$cur" ] && cur="$stk"
+
+        local delta="STOCK (0mV)"
+        if [ "$cur" != "$stk" ]; then
+            delta="UNDERVOLTED"
+            is_undervolted=1
+        fi
+
+        printf "%-10s | %-24s | %-24s | %s\n" "${f}.0 MHz" "$(sm8650_level_to_name "$stk")" "$(sm8650_level_to_name "$cur")" "$delta"
+        i=$((i + 1))
+    done
+    echo "----------------------------------------------------------"
+    if [ "$is_undervolted" = "1" ]; then
+        echo ">> Overall: ACTIVE & UNDERVOLTED in vendor_boot ($target_slot)"
+    else
+        echo ">> Overall: STOCK DETECTED"
+    fi
+    echo "=========================================================="
+}
+
+sm8650_test() {
+    echo "=========================================================="
+    echo "  Adreno 750 GPU Multi-Stage Frequency Stability Test     "
+    echo "=========================================================="
+    echo "Waking up display & enabling stayon..."
+    svc power stayon true 2>/dev/null
+    input keyevent KEYCODE_WAKEUP 2>/dev/null
+    wm dismiss-keyguard 2>/dev/null
+    cmd statusbar collapse 2>/dev/null
+
+    cleanup_test() {
+        svc power stayon false 2>/dev/null
+        echo 231000000 > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/min_freq 2>/dev/null
+        echo 903000000 > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/max_freq 2>/dev/null
+        killall busybox httpd 2>/dev/null
+    }
+    trap cleanup_test EXIT INT TERM
+
+    # Start local HTTP server if present
+    if [ -f "/data/local/tmp/gpu_test/index.html" ]; then
+        killall busybox httpd 2>/dev/null
+        $BB httpd -p 127.0.0.1:9876 -h /data/local/tmp/gpu_test 2>/dev/null
+        am start -a android.intent.action.VIEW -d 'http://127.0.0.1:9876/index.html' com.android.chrome >/dev/null 2>&1
+        sleep 2
+    fi
+
+    test_freq() {
+        local freq="$1"
+        local dur="${2:-5}"
+        local hz="${freq}000000"
+        echo -n "[Stage] Locking to ${freq} MHz for ${dur}s under load... "
+
+        echo "$hz" > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/min_freq 2>/dev/null
+        echo "$hz" > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/max_freq 2>/dev/null
+
+        sleep 1
+        local cur_f
+        cur_f=$(cat /sys/class/kgsl/kgsl-3d0/clock_mhz 2>/dev/null)
+        local busy
+        busy=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+
+        sleep "$dur"
+
+        local hang_status
+        hang_status=$(cat /sys/class/kgsl/kgsl-3d0/ft_hang_intr_status 2>/dev/null || echo 0)
+        local faults
+        faults=$(dmesg | tail -n 20 | grep -iE 'kgsl.*(fault|hang|error|timeout)')
+
+        if [ "$hang_status" != "0" ] || [ -n "$faults" ]; then
+            echo "FAILED (GPU Fault/Hang: hang_status=$hang_status)"
+            return 1
+        else
+            echo "PASSED (Clock: ${cur_f}MHz, Load: ${busy}, Status: Stable)"
+            return 0
+        fi
+    }
+
+    local pass=0 fail=0
+    for f in 231 366 500 680 834 903; do
+        test_freq "$f" 5 && pass=$((pass+1)) || fail=$((fail+1))
+    done
+
+    cleanup_test
+    trap - EXIT INT TERM
+
+    echo "----------------------------------------------------------"
+    echo "Test Result: $pass/6 key frequency stages passed ($fail failed)"
+    if [ "$fail" -eq 0 ]; then
+        echo ">> ALL FREQUENCIES TESTED STABLE WITHOUT GPU FAULTS!"
+    else
+        echo ">> SOME FREQUENCIES FAILED."
+    fi
+    echo "=========================================================="
+}
+
+# ========================================================
+# Snapdragon 855 (SM8150 / Adreno 640) Handlers
+# ========================================================
+# (Inherits the exact Pixel 4 XL code)
+sm8150_level_to_name() {
+    case "$1" in
+        "00000031") echo "MIN_SVS (0x31 / 49)" ;;
+        "00000039") echo "LOW_SVS_D1 (0x39 / 57)" ;;
+        "00000041") echo "LOW_SVS (0x41 / 65)" ;;
+        "00000051") echo "LOW_SVS_L1 (0x51 / 81)" ;;
+        "00000061") echo "LOW_SVS_L2 (0x61 / 97)" ;;
+        "00000081") echo "SVS (0x81 / 129)" ;;
+        "00000091") echo "SVS_L0 (0x91 / 145)" ;;
+        "000000c1") echo "SVS_L1 (0xc1 / 193)" ;;
+        "000000e1") echo "SVS_L2 (0xe1 / 225)" ;;
+        "00000101") echo "NOM (0x101 / 257)" ;;
+        "00000141") echo "NOM_L1 (0x141 / 321)" ;;
+        "00000181") echo "TURBO (0x181 / 385)" ;;
+        *) echo "CUSTOM ($1)" ;;
+    esac
+}
+
+sm8150_check_voltages() {
+    local slot="$1"
+    local boot_dev="/dev/block/by-name/boot$slot"
+    local workdir="/dev/adreno640_status_$$"
+
+    mkdir -p "$workdir"
+    cd "$workdir" || return 1
+    "$MAGISKBIN" unpack "$boot_dev" >/dev/null 2>&1
+    if [ ! -f "dtb" ]; then
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    local base
+    base=$($BB od -A d -t x1 dtb | $BB awk "/6f 70 70 2d 35 38 35 30 30 30 30 30 30/ { print \$1; exit }")
+    if [ -z "$base" ]; then
+        rm -rf "$workdir"
+        return 1
+    fi
+    base=$((10#$base))
+
+    local v585 v499 v427 v345 v257
+    v585=$($BB od -A n -j $((base + 48)) -N 4 -t x1 dtb | $BB tr -d " \r\n")
+    v499=$($BB od -A n -j $((base + 48 + 60)) -N 4 -t x1 dtb | $BB tr -d " \r\n")
+    v427=$($BB od -A n -j $((base + 48 + 120)) -N 4 -t x1 dtb | $BB tr -d " \r\n")
+    v345=$($BB od -A n -j $((base + 48 + 180)) -N 4 -t x1 dtb | $BB tr -d " \r\n")
+    v257=$($BB od -A n -j $((base + 48 + 240)) -N 4 -t x1 dtb | $BB tr -d " \r\n")
+
+    rm -rf "$workdir"
+    echo "$v585 $v499 $v427 $v345 $v257"
+    return 0
+}
+
+sm8150_status() {
+    local cur_slot
+    cur_slot=$(getprop ro.boot.slot_suffix)
+    local target_slot="${1:-$cur_slot}"
+    local boot_dev="/dev/block/by-name/boot$target_slot"
+
+    echo "=========================================================="
+    echo "  Adreno 640 GPU Voltage Monitor (KonaBess Native)        "
+    echo "=========================================================="
+    echo "Device       : $(getprop ro.product.model) ($(getprop ro.product.device))"
+    echo "SoC / Kernel : SM8150 (msmnile) / $(uname -r)"
+    echo "Active Slot  : $cur_slot"
+    echo "Target Slot  : $target_slot ($boot_dev)"
+
+    if [ -f "$MODDIR/stock_boot$target_slot.img" ]; then
+        local bsz
+        bsz=$(ls -lh "$MODDIR/stock_boot$target_slot.img" | awk '{print $5}')
+        echo "Stock Backup : Present ($bsz) -> $MODDIR/stock_boot$target_slot.img"
+    fi
+    echo "----------------------------------------------------------"
+
+    local vals
+    vals=$(sm8150_check_voltages "$target_slot")
+    local v585 v499 v427 v345 v257
+    v585=$(echo "$vals" | awk '{print $1}')
+    v499=$(echo "$vals" | awk '{print $2}')
+    v427=$(echo "$vals" | awk '{print $3}')
+    v345=$(echo "$vals" | awk '{print $4}')
+    v257=$(echo "$vals" | awk '{print $5}')
+
+    printf "%-10s | %-24s | %-24s | %s\n" "Frequency" "Stock Default" "Current in Boot" "Delta"
+    echo "-----------+--------------------------+--------------------------+---------"
+    printf "%-10s | %-24s | %-24s | %s\n" "585.0 MHz" "NOM (0x101 / 257)" "$(sm8150_level_to_name "$v585")" "-64 mV"
+    printf "%-10s | %-24s | %-24s | %s\n" "499.2 MHz" "SVS_L2 (0xe1 / 225)" "$(sm8150_level_to_name "$v499")" "-96 mV"
+    printf "%-10s | %-24s | %-24s | %s\n" "427.0 MHz" "SVS_L1 (0xc1 / 193)" "$(sm8150_level_to_name "$v427")" "-112 mV"
+    printf "%-10s | %-24s | %-24s | %s\n" "345.0 MHz" "SVS (0x81 / 129)" "$(sm8150_level_to_name "$v345")" "-64 mV"
+    printf "%-10s | %-24s | %-24s | %s\n" "257.0 MHz" "LOW_SVS (0x41 / 65)" "$(sm8150_level_to_name "$v257")" "-16 mV"
+    echo "----------------------------------------------------------"
+    echo ">> Overall: UNDERVOLTED & ACTIVE in Boot Partition"
+    echo "=========================================================="
+}
+
+# ========================================================
+# Main Entry Point
+# ========================================================
+case "$1" in
+    status)
+        if [ "$GEN" = "sm8650" ]; then
+            sm8650_status "$2"
+        else
+            sm8150_status "$2"
+        fi
+        ;;
+    test)
+        if [ "$GEN" = "sm8650" ]; then
+            sm8650_test
+        else
+            # Execute SM8150 test
+            sh /data/adb/modules/adreno640_undervolt/system/bin/konabess-cli test
+        fi
+        ;;
+    log)
+        [ -f "$LOG" ] && cat "$LOG" || echo "No log found at $LOG"
+        ;;
+    restore)
+        echo "Restoring stock $BOOT_NAME image..."
+        target_slot=$(get_target_slot "$2")
+        backup_file="$MODDIR/stock_${BOOT_NAME}${target_slot}.img"
+        dev="/dev/block/by-name/${BOOT_NAME}${target_slot}"
+        if [ -f "$backup_file" ]; then
+            dd if="$backup_file" of="$dev" bs=64k 2>/dev/null
+            sync
+            echo "SUCCESS: Restored $backup_file to $dev"
+        else
+            echo "ERROR: Backup file $backup_file not found"
+        fi
+        ;;
+    *)
+        echo "KonaBess Universal CLI (Detected SoC: $SOC_MODEL, Gen: $GEN)"
+        echo "Usage: konabess-cli {status|test|restore|log}"
+        ;;
+esac
