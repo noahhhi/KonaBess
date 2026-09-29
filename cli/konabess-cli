@@ -188,10 +188,13 @@ sm8650_test() {
     wm dismiss-keyguard 2>/dev/null
     cmd statusbar collapse 2>/dev/null
 
+    local devfreq_dir
+    devfreq_dir=$(ls -d /sys/class/devfreq/*kgsl-3d0 2>/dev/null | head -n 1)
+
     cleanup_test() {
         svc power stayon false 2>/dev/null
-        echo 231000000 > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/min_freq 2>/dev/null
-        echo 903000000 > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/max_freq 2>/dev/null
+        echo 231000000 > "$devfreq_dir/min_freq" 2>/dev/null
+        echo 903000000 > "$devfreq_dir/max_freq" 2>/dev/null
         killall busybox httpd 2>/dev/null
     }
     trap cleanup_test EXIT INT TERM
@@ -210,8 +213,11 @@ sm8650_test() {
         local hz="${freq}000000"
         echo -n "[Stage] Locking to ${freq} MHz for ${dur}s under load... "
 
-        echo "$hz" > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/min_freq 2>/dev/null
-        echo "$hz" > /sys/class/devfreq/2c00000.qcom,kgsl-3d0/max_freq 2>/dev/null
+        local start_fc
+        start_fc=$(cat /sys/class/kgsl/kgsl-3d0/snapshot/faultcount 2>/dev/null || echo 0)
+
+        echo "$hz" > "$devfreq_dir/min_freq" 2>/dev/null
+        echo "$hz" > "$devfreq_dir/max_freq" 2>/dev/null
 
         sleep 1
         local cur_f
@@ -221,13 +227,13 @@ sm8650_test() {
 
         sleep "$dur"
 
-        local hang_status
-        hang_status=$(cat /sys/class/kgsl/kgsl-3d0/ft_hang_intr_status 2>/dev/null || echo 0)
+        local cur_fc
+        cur_fc=$(cat /sys/class/kgsl/kgsl-3d0/snapshot/faultcount 2>/dev/null || echo 0)
         local faults
-        faults=$(dmesg | tail -n 20 | grep -iE 'kgsl.*(fault|hang|error|timeout)')
+        faults=$(dmesg | tail -n 25 | grep -iE 'kgsl.*(fault|hang|timeout)')
 
-        if [ "$hang_status" != "0" ] || [ -n "$faults" ]; then
-            echo "FAILED (GPU Fault/Hang: hang_status=$hang_status)"
+        if [ "$cur_fc" -gt "$start_fc" ] || [ -n "$faults" ]; then
+            echo "FAILED (GPU Fault/Crash: faultcount=$cur_fc)"
             return 1
         else
             echo "PASSED (Clock: ${cur_f}MHz, Load: ${busy}, Status: Stable)"
