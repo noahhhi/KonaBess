@@ -63,6 +63,23 @@ konabess-cli log
 
 ---
 
+### 进阶调优：OPPO / 一加 ORMS 核心调度解密与调优 (`orm-crypto`)
+
+针对 ColorOS / Oplus 系统的核心资源管理服务（ORMS），`cli/orm-crypto` 提供了与 [ShevonKuan/ORMEncryption](https://github.com/ShevonKuan/ORMEncryption) 完全兼容的原生加解密引擎（AES-128-GCM），可直接通过 ADB 提取、调优并推送生效：
+
+```bash
+# 1. 直接从连接的设备中拉取并解密当前活跃的 orms_core_config.xml
+orm-crypto pull -o my_orms_config.xml
+
+# 2. 手动解密本地已有的加密文件
+orm-crypto decrypt -i orms_core_config.xml -o orms_decrypted.xml
+
+# 3. 调优编辑 XML 配置后，重新加密并直接推送回设备激活（自动备份原文件）
+orm-crypto push -i my_orms_tuned.xml
+```
+
+---
+
 ## English
 
 ### Introduction
@@ -74,6 +91,16 @@ Key Features:
 - **5-Stage Full Load Stress Testing**: Embedded WebGL 2.0 fractal raymarching shader + devfreq clock clamping for 99% GPU load validation.
 - **Ladder-based Auto-Bumping**: Allows stepping voltages up or down on the Qualcomm RPMh ladder with instant re-flashing.
 - **Universal Multi-SoC Support**: Supports Snapdragon 855 (`msmnile`) up to Snapdragon 8 Gen 3 (`pineapple`).
+- **ORMS Tuning Tool**: Built-in `orm-crypto` CLI for decrypting, tuning, and pushing OPPO/OnePlus ColorOS `orms_core_config.xml` files.
 
 ### Installation
 Flash `KonaBess-CLI-Universal-v2.0.zip` in Magisk, KernelSU, or APatch. Reboot, then run `konabess-cli` as root.
+
+### ORMS Crypto & Tuning
+```bash
+# Pull and decrypt active config directly from device
+orm-crypto pull -o orms_decrypted.xml
+
+# Push tuned config back to device (auto-encrypts and creates .bak backup)
+orm-crypto push -i orms_decrypted.xml
+```

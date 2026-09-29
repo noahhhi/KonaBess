@@ -1,0 +1,128 @@
+#!/usr/bin/env node
+/**
+ * ORMEncryption Tool for Oppo/OnePlus/Realme orms_core_config.xml
+ * Supports AES-128-GCM encrypt/decrypt compatible with ShevonKuan/ORMEncryption
+ */
+
+const crypto = require('crypto');
+const fs = require('fs');
+const { execSync } = require('child_process');
+
+const KEY_PHRASE = 'ORMS';
+const hasher = crypto.createHash('sha256');
+hasher.update(KEY_PHRASE);
+const KEY = Buffer.from(hasher.digest('hex').slice(0, 16), 'utf-8');
+
+function decrypt(base64Data) {
+    const decoded = Buffer.from(base64Data.trim(), 'base64');
+    const ivLength = decoded[0];
+    const nonce = decoded.subarray(1, 1 + ivLength);
+    const ciphertextAndTag = decoded.subarray(1 + ivLength);
+    const ciphertext = ciphertextAndTag.subarray(0, ciphertextAndTag.length - 16);
+    const tag = ciphertextAndTag.subarray(ciphertextAndTag.length - 16);
+
+    const decipher = crypto.createDecipheriv('aes-128-gcm', KEY, nonce);
+    decipher.setAuthTag(tag);
+    let decrypted = decipher.update(ciphertext, null, 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+}
+
+function encrypt(plaintext) {
+    const nonce = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-128-gcm', KEY, nonce);
+    let encrypted = cipher.update(plaintext, 'utf8');
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    const buffer = Buffer.concat([
+        Buffer.from([12]),
+        nonce,
+        encrypted,
+        tag
+    ]);
+    return buffer.toString('base64');
+}
+
+function printHelp() {
+    console.log(`
+ORMEncryption CLI (Node.js Universal Engine)
+Compatible with ShevonKuan/ORMEncryption
+
+Usage:
+  orm-crypto decrypt -i <encrypted-file> [-o <decrypted.xml>]
+  orm-crypto encrypt -i <decrypted.xml> [-o <encrypted-file>]
+  orm-crypto pull [-o <local-decrypted.xml>]
+  orm-crypto push -i <local-decrypted.xml>
+`);
+}
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+if (!cmd || cmd === '-h' || cmd === '--help') {
+    printHelp();
+    process.exit(0);
+}
+
+function getArg(flag, shortFlag) {
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === flag || args[i] === shortFlag) {
+            return args[i + 1];
+        }
+    }
+    return null;
+}
+
+if (cmd === 'decrypt') {
+    const input = getArg('--input', '-i');
+    const output = getArg('--output', '-o');
+    if (!input) {
+        console.error('Error: -i / --input required.');
+        process.exit(1);
+    }
+    const raw = fs.readFileSync(input, 'utf-8');
+    const plain = decrypt(raw);
+    if (output) {
+        fs.writeFileSync(output, plain, 'utf-8');
+        console.log(`Decrypted ${input} -> ${output} (${plain.length} chars)`);
+    } else {
+        process.stdout.write(plain);
+    }
+} else if (cmd === 'encrypt') {
+    const input = getArg('--input', '-i');
+    const output = getArg('--output', '-o') || './orms_core_config_encrypted.xml';
+    if (!input) {
+        console.error('Error: -i / --input required.');
+        process.exit(1);
+    }
+    const plain = fs.readFileSync(input, 'utf-8');
+    const enc = encrypt(plain);
+    fs.writeFileSync(output, enc, 'utf-8');
+    console.log(`Encrypted ${input} -> ${output} (${enc.length} bytes base64)`);
+} else if (cmd === 'pull') {
+    const output = getArg('--output', '-o') || './orms_core_config_decrypted.xml';
+    console.log('Pulling /data/system/orms/orms_core_config.xml from device...');
+    const raw = execSync('adb shell "su -c cat /data/system/orms/orms_core_config.xml"').toString('utf-8');
+    const plain = decrypt(raw);
+    fs.writeFileSync(output, plain, 'utf-8');
+    console.log(`Success! Decrypted device config saved to ${output}`);
+} else if (cmd === 'push') {
+    const input = getArg('--input', '-i');
+    if (!input) {
+        console.error('Error: -i / --input required.');
+        process.exit(1);
+    }
+    const plain = fs.readFileSync(input, 'utf-8');
+    const enc = encrypt(plain);
+    fs.writeFileSync('/tmp/orms_push_tmp.xml', enc, 'utf-8');
+    console.log('Backing up device config to /data/system/orms/orms_core_config.xml.bak...');
+    execSync('adb shell "su -c cp /data/system/orms/orms_core_config.xml /data/system/orms/orms_core_config.xml.bak"');
+    console.log('Pushing and activating encrypted config on device...');
+    execSync('adb push /tmp/orms_push_tmp.xml /data/local/tmp/orms_push_tmp.xml');
+    execSync('adb shell "su -c cp /data/local/tmp/orms_push_tmp.xml /data/system/orms/orms_core_config.xml && chmod 777 /data/system/orms/orms_core_config.xml && rm /data/local/tmp/orms_push_tmp.xml"');
+    fs.unlinkSync('/tmp/orms_push_tmp.xml');
+    console.log('Success! Tuned config deployed to /data/system/orms/orms_core_config.xml');
+} else {
+    printHelp();
+}
